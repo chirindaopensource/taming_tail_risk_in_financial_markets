@@ -1,0 +1,310 @@
+﻿# ==============================================================================
+# Taming Tail Risk in Financial Markets: Conformal Risk Control for
+# Nonstationary Portfolio VaR
+#
+# Full Study Input Configuration (Reproduction-Grade)
+#
+# This file explicitly specifies:
+# - Raw data requirements
+# - Deterministic transformation conventions (rolling windows, quantiles)
+# - Base forecaster definitions (HS and GBDT)
+# - Conformal wrappers (SWC/TWC/RWC/ACI)
+# - Tuning grids and objectives
+# - Evaluation regime definitions and backtest conventions
+#
+# Author: Marc Schmitt (University of Oxford)
+# Replication Input Spec: MIT PhD Professor of CS, Mathematics of Finance
+# ==============================================================================
+
+# ==============================================================================
+# 0. REPRODUCTION INTENT (controls strictness)
+# ==============================================================================
+reproduction_target:
+  # "conceptual": reproduces methodology qualitatively
+  # "exact_numeric": requires author-matching base-model features/hyperparams
+  # and all conventions pinned
+  mode: "exact_numeric"
+
+# ==============================================================================
+# 1. RAW DATA SCHEMA (INPUT STRUCTURE)
+# ==============================================================================
+raw_data_schemas:
+  market_data:
+    description: "Daily U.S. equity data from the CRSP value-weighted market index."
+    source: "CRSP via WRDS"
+    frequency: "Daily trading days (close-to-close returns)"
+    columns:
+      DATE:
+        dtype: "datetime64[ns]"
+        description: "Trading date. Must be unique and strictly increasing."
+        constraints:
+          - "trading_days_only"
+          - "no_resampling"
+          - "no_fill"
+          - "strictly_increasing"
+          - "unique"
+      VWRETD:
+        dtype: "float64"
+        description: "Value-Weighted Return including Distributions (total return)."
+        unit: "decimal_return"
+        constraints:
+          - "unit_check_required"
+          - "missingness_policy_applies"
+
+# ==============================================================================
+# 2. MISSING DATA POLICY (MUST BE EXPLICIT)
+# ==============================================================================
+missing_data_policy:
+  policy: "error_if_missing" # or "drop_missing_rows" (must then log dropped dates)
+  columns_checked:
+    - "VWRETD"
+
+# ==============================================================================
+# 3. GLOBAL STUDY CONFIGURATION
+# ==============================================================================
+global_config:
+  risk_objective:
+    target_alpha: 0.01
+    confidence_level: 0.99
+    var_type: "one-sided-upper-loss-bound"
+    coverage_goal_equation: "P(y_t <= U_t(x_t)) >= 1-alpha"
+  temporal_definitions:
+    trading_days_per_year: 252
+    time_index_unit: "trading_day_step" # ensures (t-i) is index distance, not calendar days
+  data_splits:
+    train_period:
+      - "1990-03-30"
+      - "2011-01-31"
+    validation_period:
+      - "2011-02-01"
+      - "2018-01-16"
+    test_period:
+      - "2018-01-17"
+      - "2024-12-31"
+    date_inclusivity:
+      start_inclusive: true
+      end_inclusive: true
+    expected_test_observations_N: 1751
+
+# ==============================================================================
+# 4. DETERMINISTIC TRANSFORMATION CONVENTIONS (CRITICAL FOR FIDELITY)
+# ==============================================================================
+transform_conventions:
+  # 4.1 Return/Loss convention (paper definition)
+  return_and_loss:
+    r_port_definition: "r_t^{port} := VWRETD_t"
+    loss_definition_equation: "y_t = -r_t^{port}"
+
+  # 4.2 Rolling window conventions (must be pinned)
+  rolling_windows:
+    endpoint_rule: "exclude_current_t" # e.g., RV21 uses t-21 : t-1
+    min_periods_policy: "require_full_window"
+    # ddof is NOT specified in the excerpt; must be fixed to match authors' implementation.
+    std_ddof: "REQUIRED_FROM_AUTHORS_CODE_OR_APPENDIX"
+    index_unit: "trading_day_step"
+
+  # 4.3 Quantile conventions (must be pinned; do not rely on library defaults)
+  quantiles:
+    weighted_quantile_definition_equation: "Q^{tilde w}_{gamma}({v_i}) := inf{q : sum_i tilde w_i 1{v_i<= q} >= gamma}"
+    unweighted_quantile_definition: "REQUIRED_EXPLICIT_CONVENTION_MATCHING_AUTHORS"
+    ties_policy: "implied_by_infimum_definition"
+
+# ==============================================================================
+# 5. FEATURE ENGINEERING (REGIME EMBEDDING z_t)
+# ==============================================================================
+feature_engineering:
+  regime_embedding_z:
+    dimensionality: 2
+    components:
+      RV21:
+        description: "21-day realized volatility (annualized)."
+        equation: "RV21_t := sqrt(252) * Std(r^{port}_{t-21:t-1})"
+        window_size: 21
+        annualization_factor: 252
+      MAR5:
+        description: "5-day mean absolute return."
+        equation: "MAR5_t := (1/5) * sum_{j=1}^5 |r^{port}_{t-j}|"
+        window_size: 5
+    preprocessing:
+      standardization:
+        method: "zscore"
+        # paper text uses both "training-period" and "pre-test"; must match authors.
+        fit_period: "REQUIRED_FROM_AUTHORS (train_only vs pre_test)"
+        apply_to:
+          - "validation"
+          - "test"
+        leakage_constraint: "fit_statistics_must_not_use_test_data"
+
+# ==============================================================================
+# 6. FORECAST START RULE (t0 must be explicit)
+# ==============================================================================
+forecast_start_rule:
+  t0_definition: "First time t such that: (a) RV21_t and MAR5_t defined under require_full_window; (b) base forecaster can produce qhat_t using only <t data; (c) conformal calibration set I_t is nonempty."
+
+# ==============================================================================
+# 7. BASE FORECASTERS (HS and GBDT)
+# ==============================================================================
+base_models:
+  HS:
+    name: "Historical Simulation"
+    type: "Rolling Empirical Quantile of past losses"
+    outputs:
+      qhat_t: "estimate of conditional (1-alpha) quantile of y_t"
+    parameters:
+      # excerpt does not specify; must match authors for exact replication
+      rolling_window_length_L: "REQUIRED_FROM_AUTHORS"
+      quantile_level: 0.99
+      training_scheme: "rolling"
+      quantile_convention_ref: "transform_conventions.quantiles.unweighted_quantile_definition"
+
+  GBDT:
+    name: "Gradient Boosting Decision Trees"
+    type: "Quantile Regression (Pinball/Check loss)"
+    outputs:
+      qhat_t: "estimate of conditional (1-alpha) quantile of y_t"
+    parameters:
+      # all fields below are required for exact reproduction; excerpt underspecifies them
+      feature_vector_x_t_definition: "REQUIRED_FROM_AUTHORS (exact covariates and lags)"
+      training_window_length_L: "REQUIRED_FROM_AUTHORS"
+      refit_frequency: "REQUIRED_FROM_AUTHORS"
+      library: "REQUIRED_FROM_AUTHORS (e.g., LightGBM/XGBoost/sklearn)"
+      library_version: "REQUIRED_FROM_AUTHORS"
+      objective: "quantile"
+      quantile_level: 0.99
+      hyperparameters: "REQUIRED_FROM_AUTHORS (trees, depth, lr, subsample, reg, etc.)"
+      random_seed: "REQUIRED_FROM_AUTHORS"
+      determinism_flags: "REQUIRED_FROM_AUTHORS"
+      missing_value_handling: "REQUIRED_FROM_AUTHORS"
+
+# ==============================================================================
+# 8. CONFORMAL WRAPPERS (SWC, TWC, RWC, ACI)
+# ==============================================================================
+conformal_wrappers:
+  common_definitions:
+    score_equation: "s_t := y_t - qhat_t"
+    bound_equation: "U_t := qhat_t + chat_t"
+    calibration_index_set_equation: "I_t := { i : max(1,t-m) <= i <= t-1 }"
+
+  SWC:
+    name: "Sliding-Window Conformal"
+    parameters:
+      m: 252
+    weighting: "uniform over I_t"
+    threshold: "unweighted empirical (1-alpha) quantile of scores in I_t"
+
+  TWC:
+    name: "Time-Weighted Conformal"
+    parameters:
+      GBDT_optimized:
+        m: 756
+        lambda: 0.005
+      HS_optimized:
+        m: 756
+        lambda: 0.010
+    weights_equation: "w_i(t) propto exp(-lambda*(t-i))"
+    normalize_equation: "wtilde_i(t) := w_i(t) / sum_{j in I_t} w_j(t)"
+    threshold_equation: "chat_t := Q^{wtilde(t)}_{1-alpha}({s_i}_{i in I_t})"
+
+  RWC:
+    name: "Regime-Weighted Conformal"
+    parameters:
+      GBDT_optimized:
+        m: 756
+        lambda: 0.005
+        h: 1.0
+        n_eff_min: 100
+      HS_optimized:
+        m: 756
+        lambda: 0.010
+        h: 2.0
+        n_eff_min: 30
+    kernel:
+      type: "Gaussian RBF"
+      equation: "K_h(z_i,z_t) := exp(-||z_i - z_t||^2 / (2h^2))"
+    weights_equation: "w_i(t) propto exp(-lambda*(t-i)) * K_h(z_i,z_t)"
+    normalize_equation: "wtilde_i(t) := w_i(t) / sum_{j in I_t} w_j(t)"
+    ess_equation: "n_eff(t) := 1 / sum_{i in I_t} wtilde_i(t)^2"
+    ess_safeguard_rule: "if n_eff(t) < n_eff_min: set K_h = 1 for that step (fallback to TWC weights)"
+    # experiments use 1-alpha (not rho_t)
+    finite_sample_correction:
+      use_rho_t: false
+      rho_t_equation_if_used: "see paper Eq (inflated level)"
+    threshold_equation: "chat_t := Q^{wtilde(t)}_{1-alpha}({s_i}_{i in I_t})"
+
+  ACI:
+    name: "Adaptive Conformal Inference"
+    parameters:
+      m: 252
+      GBDT_optimized_gamma: 0.005
+      HS_optimized_gamma: 0.002
+      alpha_bounds:
+        alpha_min: 0.0001
+        alpha_max: 0.2
+    update_equation: "alpha_{t+1} := Pi_[alpha_min,alpha_max]( alpha_t + gamma*(alpha - 1{y_t > U_t}) )"
+    threshold_rule: "unweighted empirical (1-alpha_t) quantile of last m scores"
+
+# ==============================================================================
+# 9. HYPERPARAMETER TUNING (VALIDATION GRID SEARCH)
+# ==============================================================================
+tuning:
+  validation_objective_equation: "|Exc_val - alpha| + 0.5*max(0, RollMax_val - alpha)"
+  rolling_window_for_RollMax: 252
+  grids:
+    SWC_TWC_RWC:
+      m:
+        - 252
+        - 504
+        - 756
+      lambda:
+        - 0.002
+        - 0.005
+        - 0.01
+      h_RWC_only:
+        - 0.5
+        - 1
+        - 2
+    ACI:
+      gamma:
+        - 0.002
+        - 0.005
+        - 0.01
+        - 0.02
+      m_fixed: 252
+  selection_rule: "argmin objective; tie_break_rule REQUIRED_EXPLICIT"
+
+# ==============================================================================
+# 10. EVALUATION (METRICS, REGIMES, BACKTESTS, PLOTS)
+# ==============================================================================
+evaluation:
+  metrics:
+    overall_exceedance: "mean(1{y_t > U_t}) over test period"
+    avg_bound_tightness: "mean(U_t) over test period"
+    rolling_exceedance:
+      window: 252
+      endpoint: "inclusive_at_t"
+      warmup_policy: "REQUIRED_EXPLICIT"
+
+  regimes:
+    stratification_variable: "RV21"
+    num_bins: 5
+    binning_method: "quintiles"
+    cutpoint_reference_period: "REQUIRED_FROM_AUTHORS (test_only vs pre_test vs full_sample)"
+
+  regime_stability_summary:
+    definitions:
+      Delta_k: "exceedance_quintile_k - target_exceedance"
+      Reg-MAE: "(1/5) * sum_k |Delta_k|"
+      Reg-MaxDev: "max_k |Delta_k|"
+      Reg-Std: "Std({Delta_k}_k)"
+
+  backtests:
+    tests:
+      - "Kupiec UC"
+      - "Christoffersen IND"
+      - "Christoffersen CC"
+    implementation_convention: "REQUIRED_EXPLICIT (formula and edge-case handling)"
+
+  plotting:
+    rolling_window: 252
+    target_line_alpha: 0.01
+    test_start_marker: "2018-01-17"
